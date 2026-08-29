@@ -62,6 +62,7 @@ next_schedule_id = 1
 
 
 SERVER_CHOICES = [
+    app_commands.Choice(name="04 Chandler", value="04 Chandler"),
     app_commands.Choice(name="12 Glendale", value="12 Glendale"),
     app_commands.Choice(name="15 Payson", value="15 Payson"),
     app_commands.Choice(name="16 Gilbert", value="16 Gilbert"),
