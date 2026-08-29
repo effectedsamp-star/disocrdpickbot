@@ -28,6 +28,10 @@ ALLOWED_STRELS_CHANNEL_IDS = [
 # /slot, /dstrel, /dslot, /addslot
 ADMIN_IDS = [
     1416863224430596107,
+    1466099103288135836,
+    1076786393658970214,
+    541552528677011457,
+    1326336317071818804,
 ]
 
 # За сколько минут до начала стрелы публиковать @everyone и карточку
@@ -74,6 +78,12 @@ FORMAT_CHOICES = [
     app_commands.Choice(name="3x3", value="3x3"),
     app_commands.Choice(name="4x4", value="4x4"),
     app_commands.Choice(name="5x5", value="5x5"),
+]
+
+# НОВОЕ: выбор дня для стрелы
+DAY_CHOICES = [
+    app_commands.Choice(name="Сегодня", value="today"),
+    app_commands.Choice(name="Завтра", value="tomorrow"),
 ]
 
 TIME_CHOICES = [
@@ -123,10 +133,13 @@ def parse_format(format_text: str) -> int:
     return formats[cleaned]
 
 
-def get_start_datetime(time_text: str) -> datetime:
+# ИЗМЕНЕНО: теперь явно выбираются сегодня или завтра
+def get_start_datetime(time_text: str, day: str) -> datetime:
     """
-    Если указанное время уже прошло сегодня,
-    стрела создаётся на это же время завтра.
+    Создаёт дату и время стрелы на сегодня или завтра.
+
+    Если выбран сегодняшний день, нельзя назначить
+    стрелу на уже прошедшее время.
     """
     hours_text, minutes_text = time_text.split(":")
 
@@ -135,15 +148,23 @@ def get_start_datetime(time_text: str) -> datetime:
 
     now = datetime.now()
 
-    start_datetime = now.replace(
+    if day == "tomorrow":
+        target_date = now + timedelta(days=1)
+    else:
+        target_date = now
+
+    start_datetime = target_date.replace(
         hour=hours,
         minute=minutes,
         second=0,
         microsecond=0
     )
 
-    if start_datetime <= now:
-        start_datetime += timedelta(days=1)
+    if day == "today" and start_datetime <= now:
+        raise ValueError(
+            "Нельзя создать стрелу на сегодня в уже прошедшее время. "
+            "Выбери «Завтра»."
+        )
 
     return start_datetime
 
@@ -229,13 +250,11 @@ class RaidView(ui.View):
         if not self.data["reserve"]:
             return
 
-        # Берём первого из резерва
         user_id = self.data["reserve"].pop(0)
         self.data["main"].append(user_id)
 
         await self.update_message()
 
-        # Уведомление в чат
         if self.message is not None:
             await self.message.channel.send(
                 f"<@{user_id}> автоматически переведён в основной состав."
@@ -254,7 +273,6 @@ class RaidView(ui.View):
         user_id = interaction.user.id
 
         async with self.lock:
-            # Если уже в основе — сообщаем
             if user_id in self.data["main"]:
                 await interaction.response.send_message(
                     "Ты уже записан в основные слоты.",
@@ -262,7 +280,6 @@ class RaidView(ui.View):
                 )
                 return
 
-            # Если в резерве и есть место в основе — переводим в основу
             if user_id in self.data["reserve"]:
                 if len(self.data["main"]) >= self.data["slots_total"]:
                     await interaction.response.send_message(
@@ -272,7 +289,6 @@ class RaidView(ui.View):
                     )
                     return
 
-                # Перенос из резерва в основу
                 self.data["reserve"].remove(user_id)
                 self.data["main"].append(user_id)
 
@@ -280,7 +296,6 @@ class RaidView(ui.View):
                 await self.update_message()
                 return
 
-            # Если не в резерве и не в основе — обычная запись в основу
             if len(self.data["main"]) >= self.data["slots_total"]:
                 await interaction.response.send_message(
                     "Основные слоты заполнены. "
@@ -347,6 +362,7 @@ class RaidView(ui.View):
 
         async with self.lock:
             removed_from_main = False
+            removed_from_reserve = False
 
             if user_id in self.data["main"]:
                 self.data["main"].remove(user_id)
@@ -354,8 +370,9 @@ class RaidView(ui.View):
 
             if user_id in self.data["reserve"]:
                 self.data["reserve"].remove(user_id)
+                removed_from_reserve = True
 
-            if not removed_from_main and user_id not in self.data["reserve"]:
+            if not removed_from_main and not removed_from_reserve:
                 await interaction.response.send_message(
                     "Ты не записан в эту стрелу.",
                     ephemeral=True
@@ -365,7 +382,6 @@ class RaidView(ui.View):
             await interaction.response.defer()
             await self.update_message()
 
-            # Если ушёл из основы — пробуем подтянуть из резерва
             if removed_from_main:
                 await self.try_pull_from_reserve()
 
@@ -474,17 +490,20 @@ async def publish_raid(schedule_id: int):
 @app_commands.describe(
     server="Выбери сервер",
     format="Выбери формат",
+    day="Выбери день проведения стрелы",
     time_str="Выбери время начала стрелы"
 )
 @app_commands.choices(
     server=SERVER_CHOICES,
     format=FORMAT_CHOICES,
+    day=DAY_CHOICES,
     time_str=TIME_CHOICES
 )
 async def slot(
     interaction: Interaction,
     server: app_commands.Choice[str],
     format: app_commands.Choice[str],
+    day: app_commands.Choice[str],
     time_str: app_commands.Choice[str]
 ):
     global next_schedule_id
@@ -505,7 +524,11 @@ async def slot(
 
     try:
         slots_total = parse_format(format.value)
-        start_time = get_start_datetime(time_str.value)
+
+        start_time = get_start_datetime(
+            time_text=time_str.value,
+            day=day.value
+        )
 
     except ValueError as error:
         await interaction.response.send_message(
@@ -518,6 +541,8 @@ async def slot(
         minutes=NOTIFICATION_BEFORE_MINUTES
     )
 
+    # Если стрела на сегодня начинается меньше чем через 20 минут,
+    # уведомление отправится сразу.
     if publish_time < datetime.now():
         publish_time = datetime.now()
 
@@ -550,8 +575,14 @@ async def slot(
     start_text = start_time.strftime("%d.%m.%Y %H:%M")
     publish_text = publish_time.strftime("%d.%m.%Y %H:%M")
 
+    if day.value == "today":
+        day_text = "Сегодня"
+    else:
+        day_text = "Завтра"
+
     await interaction.response.send_message(
         f"✅ Стрела #{schedule_id} запланирована.\n\n"
+        f"День: **{day_text}**\n"
         f"Сервер: **{server.value}**\n"
         f"Формат: **{format.value}**\n"
         f"Начало: **{start_text}**\n"
@@ -571,7 +602,6 @@ async def slot(
     description="Показать все запланированные стрелы"
 )
 async def strels(interaction: Interaction):
-    # Команду нельзя использовать в личных сообщениях
     if interaction.guild is None:
         await interaction.response.send_message(
             "Команду /strels нельзя использовать в личных сообщениях.",
@@ -579,16 +609,12 @@ async def strels(interaction: Interaction):
         )
         return
 
-    # Команда разрешена только в каналах из ALLOWED_STRELS_CHANNEL_IDS
     if interaction.channel_id not in ALLOWED_STRELS_CHANNEL_IDS:
         await interaction.response.send_message(
             "Команду /strels можно использовать только в разрешённых каналах.",
             ephemeral=True
         )
         return
-
-    # Проверки is_admin здесь НЕТ.
-    # Поэтому команду может использовать любой участник сервера.
 
     if not scheduled_raids:
         await interaction.response.send_message(
@@ -725,6 +751,7 @@ async def dslot(
 
     async with view.lock:
         removed_from_main = False
+        removed_from_reserve = False
 
         if user_id in data["main"]:
             data["main"].remove(user_id)
@@ -732,8 +759,9 @@ async def dslot(
 
         if user_id in data["reserve"]:
             data["reserve"].remove(user_id)
+            removed_from_reserve = True
 
-        if not removed_from_main and user_id not in data["reserve"]:
+        if not removed_from_main and not removed_from_reserve:
             await interaction.response.send_message(
                 "Этот игрок не записан в слоты.",
                 ephemeral=True
@@ -743,7 +771,6 @@ async def dslot(
         await interaction.response.defer(ephemeral=True)
         await view.update_message()
 
-        # Если удалили из основы — подтягиваем из резерва
         if removed_from_main:
             await view.try_pull_from_reserve()
 
