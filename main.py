@@ -1,43 +1,29 @@
 import asyncio
+import os
 from datetime import datetime, timedelta
 
 import discord
 from discord import ui, Interaction, app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
-
-# ================= НАСТРОЙКИ =================
-
-import os
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not TOKEN:
-    raise RuntimeError("Не указан токен бота. Проверь переменную окружения DISCORD_TOKEN.")
+    raise RuntimeError("Не указан токен бота. Проверь DISCORD_TOKEN.")
 
-# Канал, куда бот отправляет уведомления и карточки стрел
 CHANNEL_ID = 1543007392315474080
 
-# Каналы, где любой пользователь сервера может использовать /strels.
-# Добавь сюда ID других разрешённых каналов.
 ALLOWED_STRELS_CHANNEL_IDS = [
     1537428377428955218,
 ]
 
-# Администраторы могут использовать:
-# /slot, /dstrel, /dslot, /addslot
 ADMIN_IDS = [
     1416863224430596107,
-    1466099103288135836,
-    1076786393658970214,
-    541552528677011457,
-    1326336317071818804,
 ]
 
-# За сколько минут до начала стрелы публиковать @everyone и карточку
 NOTIFICATION_BEFORE_MINUTES = 20
-
-# ===============================================
+SCHEDULER_CHECK_SECONDS = 3
 
 
 intents = discord.Intents.default()
@@ -47,26 +33,17 @@ bot = commands.Bot(
     intents=intents
 )
 
-# Активные, уже опубликованные стрелы:
-# {message_id: {"data": data, "view": view, "message": message}}
 active_raids = {}
-
-# Последняя опубликованная стрела
 last_raid_message_id = None
 
-# Запланированные стрелы:
-# {номер: {"data": ..., "start_time": ..., "publish_time": ..., "task": ...}}
 scheduled_raids = {}
-
-# Номер следующей запланированной стрелы
 next_schedule_id = 1
 
-
-# ================= ВАРИАНТЫ ВЫБОРА =================
+publishing_raids = set()
+retry_after = {}
 
 
 SERVER_CHOICES = [
-    app_commands.Choice(name="04 Chandler", value="04 Chandler"),
     app_commands.Choice(name="12 Glendale", value="12 Glendale"),
     app_commands.Choice(name="15 Payson", value="15 Payson"),
     app_commands.Choice(name="16 Gilbert", value="16 Gilbert"),
@@ -78,12 +55,6 @@ FORMAT_CHOICES = [
     app_commands.Choice(name="3x3", value="3x3"),
     app_commands.Choice(name="4x4", value="4x4"),
     app_commands.Choice(name="5x5", value="5x5"),
-]
-
-# НОВОЕ: выбор дня для стрелы
-DAY_CHOICES = [
-    app_commands.Choice(name="Сегодня", value="today"),
-    app_commands.Choice(name="Завтра", value="tomorrow"),
 ]
 
 TIME_CHOICES = [
@@ -108,9 +79,6 @@ TIME_CHOICES = [
 ]
 
 
-# ===================================================
-
-
 def is_admin(user: discord.abc.User) -> bool:
     return user.id in ADMIN_IDS
 
@@ -126,47 +94,58 @@ def parse_format(format_text: str) -> int:
     cleaned = format_text.lower().replace(" ", "").replace("х", "x")
 
     if cleaned not in formats:
-        raise ValueError(
-            "Формат должен быть: 2x2, 3x3, 4x4 или 5x5."
-        )
+        raise ValueError("Формат: 2x2, 3x3, 4x4 или 5x5.")
 
     return formats[cleaned]
 
 
-# ИЗМЕНЕНО: теперь явно выбираются сегодня или завтра
-def get_start_datetime(time_text: str, day: str) -> datetime:
-    """
-    Создаёт дату и время стрелы на сегодня или завтра.
-
-    Если выбран сегодняшний день, нельзя назначить
-    стрелу на уже прошедшее время.
-    """
-    hours_text, minutes_text = time_text.split(":")
-
-    hours = int(hours_text)
-    minutes = int(minutes_text)
+def get_start_datetime(time_text: str) -> datetime:
+    hours, minutes = map(int, time_text.split(":"))
 
     now = datetime.now()
 
-    if day == "tomorrow":
-        target_date = now + timedelta(days=1)
-    else:
-        target_date = now
-
-    start_datetime = target_date.replace(
+    start_time = now.replace(
         hour=hours,
         minute=minutes,
         second=0,
         microsecond=0
     )
 
-    if day == "today" and start_datetime <= now:
-        raise ValueError(
-            "Нельзя создать стрелу на сегодня в уже прошедшее время. "
-            "Выбери «Завтра»."
-        )
+    if start_time <= now:
+        start_time += timedelta(days=1)
 
-    return start_datetime
+    return start_time
+
+
+def get_sorted_raids():
+    return sorted(
+        scheduled_raids.items(),
+        key=lambda item: (
+            item[1]["publish_time"],
+            item[1]["start_time"],
+            item[0]
+        )
+    )
+
+
+def get_raid_by_display_number(number: int):
+    raids = get_sorted_raids()
+
+    if number < 1 or number > len(raids):
+        return None, None
+
+    return raids[number - 1]
+
+
+def get_display_number_by_internal_id(internal_id: int):
+    for number, (raid_id, _) in enumerate(
+        get_sorted_raids(),
+        start=1
+    ):
+        if raid_id == internal_id:
+            return number
+
+    return None
 
 
 def build_embed(data: dict) -> discord.Embed:
@@ -231,19 +210,13 @@ class RaidView(ui.View):
         self.lock = asyncio.Lock()
 
     async def update_message(self):
-        if self.message is None:
-            return
-
-        await self.message.edit(
-            embed=build_embed(self.data),
-            view=self
-        )
+        if self.message is not None:
+            await self.message.edit(
+                embed=build_embed(self.data),
+                view=self
+            )
 
     async def try_pull_from_reserve(self):
-        """
-        Если в основе есть место и в резерве есть игроки,
-        первый из резерва автоматически переводится в основу.
-        """
         if len(self.data["main"]) >= self.data["slots_total"]:
             return
 
@@ -257,7 +230,8 @@ class RaidView(ui.View):
 
         if self.message is not None:
             await self.message.channel.send(
-                f"<@{user_id}> автоматически переведён в основной состав."
+                f"<@{user_id}> автоматически переведён "
+                "в основной состав."
             )
 
     @ui.button(
@@ -280,22 +254,6 @@ class RaidView(ui.View):
                 )
                 return
 
-            if user_id in self.data["reserve"]:
-                if len(self.data["main"]) >= self.data["slots_total"]:
-                    await interaction.response.send_message(
-                        "Основные слоты заполнены. "
-                        "Оставайся в резерве, пока кто‑то не освободит место.",
-                        ephemeral=True
-                    )
-                    return
-
-                self.data["reserve"].remove(user_id)
-                self.data["main"].append(user_id)
-
-                await interaction.response.defer()
-                await self.update_message()
-                return
-
             if len(self.data["main"]) >= self.data["slots_total"]:
                 await interaction.response.send_message(
                     "Основные слоты заполнены. "
@@ -303,6 +261,9 @@ class RaidView(ui.View):
                     ephemeral=True
                 )
                 return
+
+            if user_id in self.data["reserve"]:
+                self.data["reserve"].remove(user_id)
 
             self.data["main"].append(user_id)
 
@@ -322,16 +283,16 @@ class RaidView(ui.View):
         user_id = interaction.user.id
 
         async with self.lock:
-            if user_id in self.data["reserve"]:
+            if user_id in self.data["main"]:
                 await interaction.response.send_message(
-                    "Ты уже записан в резерв.",
+                    "Ты уже записан в основные слоты.",
                     ephemeral=True
                 )
                 return
 
-            if user_id in self.data["main"]:
+            if user_id in self.data["reserve"]:
                 await interaction.response.send_message(
-                    "Ты уже записан в основные слоты.",
+                    "Ты уже записан в резерв.",
                     ephemeral=True
                 )
                 return
@@ -404,40 +365,31 @@ async def get_target_channel():
 async def publish_raid(schedule_id: int):
     global last_raid_message_id
 
-    raid = scheduled_raids.get(schedule_id)
-
-    if raid is None:
+    if schedule_id in publishing_raids:
         return
-
-    publish_time = raid["publish_time"]
-    seconds_to_wait = (publish_time - datetime.now()).total_seconds()
-
-    if seconds_to_wait > 0:
-        await asyncio.sleep(seconds_to_wait)
 
     raid = scheduled_raids.get(schedule_id)
 
     if raid is None:
         return
 
-    data = raid["data"]
-    channel = await get_target_channel()
-
-    if channel is None:
-        print(
-            f"Не удалось отправить стрелу #{schedule_id}: "
-            "канал недоступен или указан неверный CHANNEL_ID."
-        )
-        scheduled_raids.pop(schedule_id, None)
-        return
+    publishing_raids.add(schedule_id)
 
     try:
+        data = raid["data"]
+        channel = await get_target_channel()
+
+        if channel is None:
+            retry_after[schedule_id] = (
+                datetime.now() + timedelta(minutes=1)
+            )
+            return
+
         await channel.send(
             f"@everyone 🏹 Через {NOTIFICATION_BEFORE_MINUTES} минут стрела!\n"
             f"Сервер: **{data['server']}**\n"
             f"Формат: **{data['format']}**\n"
             f"Время начала: **{data['time']}**",
-
             allowed_mentions=discord.AllowedMentions(
                 everyone=True,
                 users=False,
@@ -462,48 +414,67 @@ async def publish_raid(schedule_id: int):
 
         last_raid_message_id = message.id
 
+        scheduled_raids.pop(schedule_id, None)
+        retry_after.pop(schedule_id, None)
+
         print(
-            f"Стрела #{schedule_id} опубликована: "
+            f"Стрела опубликована: "
             f"{data['server']} | {data['format']} | {data['time']}"
         )
 
-    except discord.Forbidden:
+    except Exception as error:
+        retry_time = datetime.now() + timedelta(minutes=1)
+
+        retry_after[schedule_id] = retry_time
+
         print(
-            "У бота нет прав на отправку сообщений "
-            "или упоминание @everyone."
+            f"Ошибка отправки стрелы: {error}. "
+            f"Повтор в {retry_time:%H:%M:%S}"
         )
 
-    except discord.HTTPException as error:
-        print(f"Ошибка Discord: {error}")
-
     finally:
-        scheduled_raids.pop(schedule_id, None)
+        publishing_raids.discard(schedule_id)
 
 
-# ----------------- /slot -----------------
+@tasks.loop(seconds=SCHEDULER_CHECK_SECONDS)
+async def raid_scheduler():
+    now = datetime.now()
+
+    for schedule_id, raid in get_sorted_raids():
+        if raid["publish_time"] > now:
+            continue
+
+        if schedule_id in publishing_raids:
+            continue
+
+        next_retry_time = retry_after.get(schedule_id)
+
+        if next_retry_time is not None and now < next_retry_time:
+            continue
+
+        asyncio.create_task(
+            publish_raid(schedule_id)
+        )
+
+
+@raid_scheduler.before_loop
+async def before_raid_scheduler():
+    await bot.wait_until_ready()
 
 
 @bot.tree.command(
     name="slot",
     description="Запланировать новую стрелу"
 )
-@app_commands.describe(
-    server="Выбери сервер",
-    format="Выбери формат",
-    day="Выбери день проведения стрелы",
-    time_str="Выбери время начала стрелы"
-)
 @app_commands.choices(
     server=SERVER_CHOICES,
     format=FORMAT_CHOICES,
-    day=DAY_CHOICES,
     time_str=TIME_CHOICES
 )
 async def slot(
     interaction: Interaction,
     server: app_commands.Choice[str],
     format: app_commands.Choice[str],
-    day: app_commands.Choice[str],
     time_str: app_commands.Choice[str]
 ):
     global next_schedule_id
@@ -522,27 +493,13 @@ async def slot(
         )
         return
 
-    try:
-        slots_total = parse_format(format.value)
-
-        start_time = get_start_datetime(
-            time_text=time_str.value,
-            day=day.value
-        )
-
-    except ValueError as error:
-        await interaction.response.send_message(
-            f"Ошибка: {error}",
-            ephemeral=True
-        )
-        return
+    slots_total = parse_format(format.value)
+    start_time = get_start_datetime(time_str.value)
 
     publish_time = start_time - timedelta(
         minutes=NOTIFICATION_BEFORE_MINUTES
     )
 
-    # Если стрела на сегодня начинается меньше чем через 20 минут,
-    # уведомление отправится сразу.
     if publish_time < datetime.now():
         publish_time = datetime.now()
 
@@ -562,97 +519,77 @@ async def slot(
     scheduled_raids[schedule_id] = {
         "data": data,
         "start_time": start_time,
-        "publish_time": publish_time,
-        "task": None
+        "publish_time": publish_time
     }
 
-    task = asyncio.create_task(
-        publish_raid(schedule_id)
+    display_number = get_display_number_by_internal_id(
+        schedule_id
     )
 
-    scheduled_raids[schedule_id]["task"] = task
-
-    start_text = start_time.strftime("%d.%m.%Y %H:%M")
-    publish_text = publish_time.strftime("%d.%m.%Y %H:%M")
-
-    if day.value == "today":
-        day_text = "Сегодня"
-    else:
-        day_text = "Завтра"
-
     await interaction.response.send_message(
-        f"✅ Стрела #{schedule_id} запланирована.\n\n"
-        f"День: **{day_text}**\n"
+        f"✅ Стрела #{display_number} запланирована.\n\n"
         f"Сервер: **{server.value}**\n"
         f"Формат: **{format.value}**\n"
-        f"Начало: **{start_text}**\n"
-        f"Уведомление и слоты: **{publish_text}**\n"
+        f"Начало: **{start_time:%d.%m.%Y %H:%M}**\n"
+        f"Уведомление и слоты: **{publish_time:%d.%m.%Y %H:%M}**\n"
         f"Канал отправки: <#{CHANNEL_ID}>\n\n"
-        f"Посмотреть расписание: `/strels`\n"
-        f"Отменить стрелу: `/dstrel номер:{schedule_id}`",
+        f"Посмотреть расписание: `/bizwar`\n"
+        f"Отменить стрелу: `/dstrel номер:{display_number}`",
         ephemeral=True
     )
 
 
-# ----------------- /strels -----------------
-
-
 @bot.tree.command(
-    name="strels",
+    name="bizwar",
     description="Показать все запланированные стрелы"
 )
-async def strels(interaction: Interaction):
+async def bizwar(interaction: Interaction):
     if interaction.guild is None:
         await interaction.response.send_message(
-            "Команду /strels нельзя использовать в личных сообщениях.",
+            "Команду /bizwar нельзя использовать в личных сообщениях.",
             ephemeral=True
         )
         return
 
     if interaction.channel_id not in ALLOWED_STRELS_CHANNEL_IDS:
         await interaction.response.send_message(
-            "Команду /strels можно использовать только в разрешённых каналах.",
+            "Команду /bizwar можно использовать только "
+            "в разрешённых каналах.",
             ephemeral=True
         )
         return
 
     if not scheduled_raids:
         await interaction.response.send_message(
-            "📋 Сейчас нет запланированных стрел.",
-            ephemeral=False
+            "📋 Сейчас нет запланированных стрел."
         )
         return
 
     lines = []
 
-    for schedule_id, raid in sorted(scheduled_raids.items()):
+    for number, (_, raid) in enumerate(
+        get_sorted_raids(),
+        start=1
+    ):
         data = raid["data"]
-        start_time = raid["start_time"]
-        publish_time = raid["publish_time"]
 
         lines.append(
-            f"**#{schedule_id}** — "
+            f"**#{number}** — "
             f"**{data['server']}** | "
             f"**{data['format']}** | "
-            f"начало: **{start_time:%d.%m %H:%M}** | "
-            f"слоты откроются: **{publish_time:%d.%m %H:%M}**"
+            f"начало: **{raid['start_time']:%d.%m %H:%M}** | "
+            f"слоты откроются: **{raid['publish_time']:%d.%m %H:%M}**"
         )
 
     await interaction.response.send_message(
-        "📋 **Запланированные стрелы:**\n\n" + "\n".join(lines),
-        ephemeral=False
+        "📋 **Запланированные стрелы (по времени):**\n\n"
+        + "\n".join(lines)
     )
-
-
-# ----------------- /dstrel -----------------
 
 
 @bot.tree.command(
     name="dstrel",
     description="Отменить запланированную стрелу"
-)
-@app_commands.describe(
-    number="Номер стрелы из команды /strels"
 )
 async def dstrel(
     interaction: Interaction,
@@ -672,23 +609,20 @@ async def dstrel(
         )
         return
 
-    raid = scheduled_raids.get(number)
+    internal_id, raid = get_raid_by_display_number(number)
 
     if raid is None:
         await interaction.response.send_message(
-            f"Стрела #{number} не найдена или уже опубликована.",
+            f"Стрела #{number} не найдена.",
             ephemeral=True
         )
         return
 
-    task = raid["task"]
-
-    if task is not None and not task.done():
-        task.cancel()
-
     data = raid["data"]
 
-    scheduled_raids.pop(number, None)
+    scheduled_raids.pop(internal_id, None)
+    retry_after.pop(internal_id, None)
+    publishing_raids.discard(internal_id)
 
     await interaction.response.send_message(
         f"❌ Стрела #{number} отменена.\n"
@@ -699,15 +633,9 @@ async def dstrel(
     )
 
 
-# ----------------- /dslot -----------------
-
-
 @bot.tree.command(
     name="dslot",
     description="Удалить игрока из последней активной стрелы"
-)
-@app_commands.describe(
-    user="Игрок, которого нужно удалить"
 )
 async def dslot(
     interaction: Interaction,
@@ -715,23 +643,9 @@ async def dslot(
 ):
     global last_raid_message_id
 
-    if interaction.guild is None:
+    if interaction.guild is None or not is_admin(interaction.user):
         await interaction.response.send_message(
-            "Команду /dslot нельзя использовать в личных сообщениях.",
-            ephemeral=True
-        )
-        return
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "У тебя нет прав для использования этой команды.",
-            ephemeral=True
-        )
-        return
-
-    if last_raid_message_id is None:
-        await interaction.response.send_message(
-            "Сейчас нет активной опубликованной стрелы.",
+            "Команда доступна администратору на сервере.",
             ephemeral=True
         )
         return
@@ -740,38 +654,35 @@ async def dslot(
 
     if raid is None:
         await interaction.response.send_message(
-            "Активная стрела не найдена.",
+            "Сейчас нет активной опубликованной стрелы.",
             ephemeral=True
         )
         return
 
     data = raid["data"]
     view = raid["view"]
-    user_id = user.id
 
     async with view.lock:
-        removed_from_main = False
-        removed_from_reserve = False
+        main = user.id in data["main"]
+        reserve = user.id in data["reserve"]
 
-        if user_id in data["main"]:
-            data["main"].remove(user_id)
-            removed_from_main = True
-
-        if user_id in data["reserve"]:
-            data["reserve"].remove(user_id)
-            removed_from_reserve = True
-
-        if not removed_from_main and not removed_from_reserve:
+        if not main and not reserve:
             await interaction.response.send_message(
                 "Этот игрок не записан в слоты.",
                 ephemeral=True
             )
             return
 
+        if main:
+            data["main"].remove(user.id)
+
+        if reserve:
+            data["reserve"].remove(user.id)
+
         await interaction.response.defer(ephemeral=True)
         await view.update_message()
 
-        if removed_from_main:
+        if main:
             await view.try_pull_from_reserve()
 
     await interaction.followup.send(
@@ -780,15 +691,9 @@ async def dslot(
     )
 
 
-# ----------------- /addslot -----------------
-
-
 @bot.tree.command(
     name="addslot",
     description="Добавить игрока в основные слоты"
-)
-@app_commands.describe(
-    user="Игрок, которого нужно добавить"
 )
 async def addslot(
     interaction: Interaction,
@@ -796,23 +701,9 @@ async def addslot(
 ):
     global last_raid_message_id
 
-    if interaction.guild is None:
+    if interaction.guild is None or not is_admin(interaction.user):
         await interaction.response.send_message(
-            "Команду /addslot нельзя использовать в личных сообщениях.",
-            ephemeral=True
-        )
-        return
-
-    if not is_admin(interaction.user):
-        await interaction.response.send_message(
-            "У тебя нет прав для использования этой команды.",
-            ephemeral=True
-        )
-        return
-
-    if last_raid_message_id is None:
-        await interaction.response.send_message(
-            "Сейчас нет активной опубликованной стрелы.",
+            "Команда доступна администратору на сервере.",
             ephemeral=True
         )
         return
@@ -821,17 +712,16 @@ async def addslot(
 
     if raid is None:
         await interaction.response.send_message(
-            "Активная стрела не найдена.",
+            "Сейчас нет активной опубликованной стрелы.",
             ephemeral=True
         )
         return
 
     data = raid["data"]
     view = raid["view"]
-    user_id = user.id
 
     async with view.lock:
-        if user_id in data["main"]:
+        if user.id in data["main"]:
             await interaction.response.send_message(
                 "Этот игрок уже находится в основных слотах.",
                 ephemeral=True
@@ -846,10 +736,10 @@ async def addslot(
             )
             return
 
-        if user_id in data["reserve"]:
-            data["reserve"].remove(user_id)
+        if user.id in data["reserve"]:
+            data["reserve"].remove(user.id)
 
-        data["main"].append(user_id)
+        data["main"].append(user.id)
 
         await interaction.response.defer(ephemeral=True)
         await view.update_message()
@@ -860,18 +750,16 @@ async def addslot(
     )
 
 
-# ----------------- События -----------------
-
-
 @bot.event
 async def on_ready():
     print(f"Бот готов: {bot.user}")
 
+    if not raid_scheduler.is_running():
+        raid_scheduler.start()
+
     await bot.change_presence(
-        status=discord.Status.online,
-        activity=discord.Activity(
-            name="Пикни слот на стрелу, чудище!",
-            type=discord.ActivityType.playing
+        activity=discord.Game(
+            "Пикни слот на стрелу, чудище!"
         )
     )
 
