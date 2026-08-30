@@ -581,7 +581,6 @@ async def bizwar(interaction: Interaction):
             f"**{data['server']}** | "
             f"**{data['format']}** | "
             f"начало: **{raid['start_time']:%d.%m %H:%M}** | "
-            f"слоты откроются: **{raid['publish_time']:%d.%m %H:%M}**"
         )
 
     await interaction.response.send_message(
