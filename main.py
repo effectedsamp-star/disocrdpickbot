@@ -1,6 +1,7 @@
 import asyncio
 import os
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import ui, Interaction, app_commands
@@ -24,7 +25,8 @@ ADMIN_IDS = [
 
 NOTIFICATION_BEFORE_MINUTES = 20
 SCHEDULER_CHECK_SECONDS = 3
-
+# Все стрелы работают по московскому времени.
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 intents = discord.Intents.default()
 
@@ -103,7 +105,7 @@ def parse_format(format_text: str) -> int:
 def get_start_datetime(time_text: str) -> datetime:
     hours, minutes = map(int, time_text.split(":"))
 
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
 
     start_time = now.replace(
         hour=hours,
@@ -382,7 +384,7 @@ async def publish_raid(schedule_id: int):
 
         if channel is None:
             retry_after[schedule_id] = (
-                datetime.now() + timedelta(minutes=1)
+                datetime.now(MOSCOW_TZ) + timedelta(minutes=1)
             )
             return
 
@@ -424,7 +426,7 @@ async def publish_raid(schedule_id: int):
         )
 
     except Exception as error:
-        retry_time = datetime.now() + timedelta(minutes=1)
+        retry_time = datetime.now(MOSCOW_TZ) + timedelta(minutes=1)
 
         retry_after[schedule_id] = retry_time
 
@@ -439,7 +441,7 @@ async def publish_raid(schedule_id: int):
 
 @tasks.loop(seconds=SCHEDULER_CHECK_SECONDS)
 async def raid_scheduler():
-    now = datetime.now()
+    now = datetime.now(MOSCOW_TZ)
 
     for schedule_id, raid in get_sorted_raids():
         if raid["publish_time"] > now:
@@ -501,8 +503,8 @@ async def slot(
         minutes=NOTIFICATION_BEFORE_MINUTES
     )
 
-    if publish_time < datetime.now():
-        publish_time = datetime.now()
+    if publish_time < datetime.now(MOSCOW_TZ):
+        publish_time = datetime.now(MOSCOW_TZ)
 
     schedule_id = next_schedule_id
     next_schedule_id += 1
